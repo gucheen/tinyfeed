@@ -46,6 +46,37 @@ https://www.htmhell.dev/feed.xml
 
 Notice that lines starting with `#` are comments and won't be parsed by tinyfeed.
 
+### Filter items from one feed
+
+You can append `include-url-pattern=REGEXP` and `exclude-url-pattern=REGEXP` to a
+feed URL. Patterns use Go regular expression syntax and are searched against the
+item's full URL. Each filter only applies to the feed URL immediately before it.
+
+For example, this keeps the English version of articles from a multilingual feed:
+
+```txt
+https://example.com/feed.xml include-url-pattern=/en/
+https://another.example/feed.xml
+```
+
+You can repeat either filter. Multiple include patterns are alternatives: an item
+must match at least one of them. An item matching any exclude pattern is always
+removed, even if it also matches an include pattern:
+
+```txt
+https://example.com/feed.xml include-url-pattern=/en/ include-url-pattern=/news/ exclude-url-pattern=/sponsored/
+```
+
+Filters can also be passed directly on the command line. Quote patterns so that
+the shell does not interpret their special characters:
+
+```bash
+tinyfeed https://example.com/feed.xml 'include-url-pattern=/en/'
+```
+
+Filtering happens before `--limit-per-feed`, so excluded items do not consume a
+feed's item limit.
+
 ## Docker caveat
 
 If you are running tinyfeed through Docker, you should be aware of the following details:
