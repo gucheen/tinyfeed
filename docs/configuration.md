@@ -19,6 +19,10 @@ Examples:
   multiple feeds   cat feeds.txt | tinyfeed > index.html
   daemon mode      tinyfeed --daemon -i feeds.txt -o index.html
 
+Feed filters:
+  Append include-url-pattern=REGEXP or exclude-url-pattern=REGEXP after a feed URL.
+  tinyfeed https://example.com/feed.xml 'include-url-pattern=/en/'
+
 Flags:
 
   Main flags:

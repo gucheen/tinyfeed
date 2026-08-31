@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"sync"
 	"syscall"
@@ -29,6 +30,26 @@ var opmlTemplate string
 type Item struct {
 	*gofeed.Item
 	FeedName string
+}
+
+type ItemFilter struct {
+	IncludeURLPatterns []string
+	ExcludeURLPatterns []string
+}
+
+type FeedSource struct {
+	URL    string
+	Filter ItemFilter
+}
+
+type compiledItemFilter struct {
+	include []*regexp.Regexp
+	exclude []*regexp.Regexp
+}
+
+type compiledFeedSource struct {
+	URL    string
+	Filter compiledItemFilter
 }
 
 func Main() {
@@ -73,19 +94,29 @@ func Main() {
 
 func Run(config *Config) error {
 	// We append inputs from file here so that it can be updated without reloading the daemon
-	fileUrls, err := fileToArgs(config.Input)
+	fileFeeds, err := fileToFeedSources(config.Input)
 	if err != nil {
 		return fmt.Errorf("fail to parse input file: %w", err)
 	}
-	urls := append(config.Urls, fileUrls...)
+	configuredFeeds := make([]FeedSource, 0, len(config.Urls))
+	for _, url := range config.Urls {
+		configuredFeeds = append(configuredFeeds, FeedSource{
+			URL:    url,
+			Filter: config.FeedFilters[url],
+		})
+	}
+	feedsToParse := mergeFeedSources(configuredFeeds, fileFeeds)
 
-	if len(urls) == 0 {
+	if len(feedsToParse) == 0 {
 		return fmt.Errorf(
 			"no argument found, you must input at least one feed url. Use `tinyfeed --help` for examples",
 		)
 	}
 
-	feeds := parseFeeds(urls, config)
+	feeds, err := parseFeeds(feedsToParse, config)
+	if err != nil {
+		return fmt.Errorf("fail to configure feed filters: %w", err)
+	}
 	items := prepareItems(feeds, config)
 
 	err = printHTML(feeds, items, config)
@@ -95,25 +126,30 @@ func Run(config *Config) error {
 	return nil
 }
 
-func parseFeeds(url_list []string, config *Config) []*gofeed.Feed {
+func parseFeeds(sources []FeedSource, config *Config) ([]*gofeed.Feed, error) {
+	compiledSources, err := compileFeedSources(sources)
+	if err != nil {
+		return nil, err
+	}
+
 	var sem = make(chan struct{}, config.RequestSemaphore)
 	var results = make(chan *gofeed.Feed)
 	var wg sync.WaitGroup
-	wg.Add(len(url_list))
+	wg.Add(len(compiledSources))
 
 	fp := gofeed.NewParser()
 	fp.UserAgent = "tinyfeed/v1"
 	fp.Client = &http.Client{Timeout: time.Duration(config.Timeout * int(time.Second))}
 
-	for _, url := range url_list {
-		go func(url string) {
+	for _, source := range compiledSources {
+		go func(source compiledFeedSource) {
 			defer func() {
 				wg.Done()
 				<-sem
 			}()
 			sem <- struct{}{}
-			results <- parseFeed(url, fp, config)
-		}(url)
+			results <- parseFeed(source, fp, config)
+		}(source)
 	}
 
 	go func() {
@@ -128,25 +164,84 @@ func parseFeeds(url_list []string, config *Config) []*gofeed.Feed {
 			feeds = append(feeds, feed)
 		}
 	}
-	return feeds
+	return feeds, nil
 }
 
-func parseFeed(url string, fp *gofeed.Parser, config *Config) *gofeed.Feed {
-	feed, err := fp.ParseURL(url)
+func parseFeed(source compiledFeedSource, fp *gofeed.Parser, config *Config) *gofeed.Feed {
+	feed, err := fp.ParseURL(source.URL)
 	if err != nil {
 		if !config.Quiet {
-			log.Printf("WARNING: fail to process feed at %s: %s\n", url, err)
+			log.Printf("WARNING: fail to process feed at %s: %s\n", source.URL, err)
 		}
 		return nil
 	}
 
 	if feed.FeedLink == "" {
-		feed.FeedLink = url
+		feed.FeedLink = source.URL
 	}
 
+	feed.Items = filterItemsByURL(feed.Items, source.Filter)
 	feed.Items = feed.Items[:min(len(feed.Items), config.LimitPerFeed)]
 
 	return feed
+}
+
+func compileFeedSources(sources []FeedSource) ([]compiledFeedSource, error) {
+	compiled := make([]compiledFeedSource, 0, len(sources))
+	for _, source := range sources {
+		filter, err := compileItemFilter(source.Filter)
+		if err != nil {
+			return nil, fmt.Errorf("feed %s: %w", source.URL, err)
+		}
+		compiled = append(compiled, compiledFeedSource{URL: source.URL, Filter: filter})
+	}
+	return compiled, nil
+}
+
+func compileItemFilter(filter ItemFilter) (compiledItemFilter, error) {
+	compiled := compiledItemFilter{}
+	for _, pattern := range filter.IncludeURLPatterns {
+		expression, err := regexp.Compile(pattern)
+		if err != nil {
+			return compiledItemFilter{}, fmt.Errorf("invalid include URL pattern %q: %w", pattern, err)
+		}
+		compiled.include = append(compiled.include, expression)
+	}
+	for _, pattern := range filter.ExcludeURLPatterns {
+		expression, err := regexp.Compile(pattern)
+		if err != nil {
+			return compiledItemFilter{}, fmt.Errorf("invalid exclude URL pattern %q: %w", pattern, err)
+		}
+		compiled.exclude = append(compiled.exclude, expression)
+	}
+	return compiled, nil
+}
+
+func filterItemsByURL(items []*gofeed.Item, filter compiledItemFilter) []*gofeed.Item {
+	filtered := make([]*gofeed.Item, 0, len(items))
+	for _, item := range items {
+		if matchesURLFilter(item.Link, filter) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+func matchesURLFilter(url string, filter compiledItemFilter) bool {
+	for _, pattern := range filter.exclude {
+		if pattern.MatchString(url) {
+			return false
+		}
+	}
+	if len(filter.include) == 0 {
+		return true
+	}
+	for _, pattern := range filter.include {
+		if pattern.MatchString(url) {
+			return true
+		}
+	}
+	return false
 }
 
 func prepareItems(feeds []*gofeed.Feed, config *Config) []Item {

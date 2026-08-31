@@ -25,6 +25,7 @@ func (i *StringRepeatable) Set(value string) error {
 // flags
 type Config struct {
 	Urls             []string
+	FeedFilters      map[string]ItemFilter
 	Limit            int
 	LimitPerFeed     int
 	Timeout          int
@@ -57,6 +58,10 @@ Examples:
   single feed      tinyfeed https://feed.lovergne.dev/releases.atom > index.html
   multiple feeds   cat feeds.txt | tinyfeed > index.html
   daemon mode      tinyfeed --daemon -i feeds.txt -o index.html
+
+Feed filters:
+  Append include-url-pattern=REGEXP or exclude-url-pattern=REGEXP after a feed URL.
+  tinyfeed https://example.com/feed.xml 'include-url-pattern=/en/'
 
 Flags:
 
@@ -91,6 +96,7 @@ func parseCmd() (*Config, error) {
 	var config Config
 	config.Scripts = make(StringRepeatable, 0)
 	config.Stylesheets = make(StringRepeatable, 0)
+	config.FeedFilters = make(map[string]ItemFilter)
 
 	fs := flag.NewFlagSet("tinyfeed", flag.ContinueOnError)
 	fs.Usage = func() {} // Disable default usage message
@@ -145,12 +151,18 @@ func parseCmd() (*Config, error) {
 		return nil, fmt.Errorf("failed to parse flags: %w", err)
 	}
 
-	// We get the inputs stdin at the start to that it can be reused by the daemon
-	strdinArgs, err := stdinToArgs()
+	argumentFeeds, err := parseFeedSources(args)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse feed arguments: %w", err)
+	}
+
+	// We get the inputs stdin at the start so that it can be reused by the daemon.
+	stdinFeeds, err := stdinToFeedSources()
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse stdin: %w", err)
 	}
-	config.Urls = append(args, strdinArgs...)
+	feeds := mergeFeedSources(argumentFeeds, stdinFeeds)
+	config.Urls, config.FeedFilters = splitFeedSources(feeds)
 
 	err = validateOrderBy(config.OrderBy)
 	if err != nil {
@@ -196,6 +208,14 @@ func stdinToArgs() ([]string, error) {
 	return []string{}, nil
 }
 
+func stdinToFeedSources() ([]FeedSource, error) {
+	fi, _ := os.Stdin.Stat()
+	if (fi.Mode() & os.ModeCharDevice) == 0 {
+		return readerToFeedSources(os.Stdin)
+	}
+	return []FeedSource{}, nil
+}
+
 func fileToArgs(filepath string) ([]string, error) {
 	if filepath == "" {
 		return []string{}, nil
@@ -205,6 +225,18 @@ func fileToArgs(filepath string) ([]string, error) {
 		return nil, fmt.Errorf("error opening input file: %s", err)
 	}
 	return readerToArgs(file)
+}
+
+func fileToFeedSources(filepath string) ([]FeedSource, error) {
+	if filepath == "" {
+		return []FeedSource{}, nil
+	}
+	file, err := os.Open(filepath)
+	if err != nil {
+		return nil, fmt.Errorf("error opening input file: %s", err)
+	}
+	defer file.Close()
+	return readerToFeedSources(file)
 }
 
 func readerToArgs(reader io.Reader) ([]string, error) {
@@ -232,6 +264,102 @@ func readerToArgs(reader io.Reader) ([]string, error) {
 		i++
 	}
 	return args, nil
+}
+
+func readerToFeedSources(reader io.Reader) ([]FeedSource, error) {
+	input, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("error reading input: %s", err)
+	}
+
+	var feeds []FeedSource
+	for lineNumber, line := range strings.Split(string(input), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		lineFeeds, err := parseFeedSources(strings.Fields(line))
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %w", lineNumber+1, err)
+		}
+		feeds = mergeFeedSources(feeds, lineFeeds)
+	}
+	return feeds, nil
+}
+
+func parseFeedSources(args []string) ([]FeedSource, error) {
+	var feeds []FeedSource
+	indexes := make(map[string]int)
+	current := -1
+
+	for _, arg := range args {
+		name, pattern, isFilter := strings.Cut(arg, "=")
+		isFilterName := name == "include-url-pattern" || name == "exclude-url-pattern"
+		if isFilterName && !isFilter {
+			return nil, fmt.Errorf("%s requires a pattern after =", name)
+		}
+		if isFilterName {
+			if current == -1 {
+				return nil, fmt.Errorf("%s must follow a feed URL", name)
+			}
+			if pattern == "" {
+				return nil, fmt.Errorf("%s cannot be empty", name)
+			}
+			filter := &feeds[current].Filter
+			if name == "include-url-pattern" {
+				filter.IncludeURLPatterns = append(filter.IncludeURLPatterns, pattern)
+			} else {
+				filter.ExcludeURLPatterns = append(filter.ExcludeURLPatterns, pattern)
+			}
+			continue
+		}
+
+		if index, ok := indexes[arg]; ok {
+			current = index
+			continue
+		}
+		indexes[arg] = len(feeds)
+		feeds = append(feeds, FeedSource{URL: arg})
+		current = len(feeds) - 1
+	}
+
+	return feeds, nil
+}
+
+func mergeFeedSources(groups ...[]FeedSource) []FeedSource {
+	var merged []FeedSource
+	indexes := make(map[string]int)
+	for _, feeds := range groups {
+		for _, feed := range feeds {
+			index, ok := indexes[feed.URL]
+			if !ok {
+				indexes[feed.URL] = len(merged)
+				merged = append(merged, feed)
+				continue
+			}
+			merged[index].Filter.IncludeURLPatterns = append(
+				merged[index].Filter.IncludeURLPatterns,
+				feed.Filter.IncludeURLPatterns...,
+			)
+			merged[index].Filter.ExcludeURLPatterns = append(
+				merged[index].Filter.ExcludeURLPatterns,
+				feed.Filter.ExcludeURLPatterns...,
+			)
+		}
+	}
+	return merged
+}
+
+func splitFeedSources(feeds []FeedSource) ([]string, map[string]ItemFilter) {
+	urls := make([]string, 0, len(feeds))
+	filters := make(map[string]ItemFilter)
+	for _, feed := range feeds {
+		urls = append(urls, feed.URL)
+		if len(feed.Filter.IncludeURLPatterns) > 0 || len(feed.Filter.ExcludeURLPatterns) > 0 {
+			filters[feed.URL] = feed.Filter
+		}
+	}
+	return urls, filters
 }
 
 func validateOrderBy(orderBy string) error {
