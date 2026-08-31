@@ -1,58 +1,52 @@
-name: test-build-and-release
+name: release
 
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "v*"
 
-permissions: {}
+permissions:
+  contents: write
 
 jobs:
-  test:
+  release:
     runs-on: ubuntu-latest
     steps:
-      - name: setup-repos
+      - name: checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: setup-go
+      - name: setup Go
         uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b
+        with:
+          go-version-file: go.mod
+          cache: true
 
-      - name: run-tests
+      - name: test
+        run: go test ./...
+
+      - name: build
         run: |
-          go test -v app/*.go
-
-  build-and-release:
-    needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: setup-repos
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-
-      - name: setup-go
-        uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b
-
-      - name: cross-platform-build
-        run: |
-          mkdir ./builds/
-          GO_LDFLAGS="-s -w" # strip debug info
-          GOARCH=arm64
-          GOOS=linux   go build -o ./builds/tinyfeed_linux_arm64
-          GOOS=freebsd go build -o ./builds/tinyfeed_freebsd_arm64
-          GOOS=darwin  go build -o ./builds/tinyfeed_darwin_arm64
-          GOOS=windows go build -o ./builds/tinyfeed_windows_arm64
-          GOARCH=amd64
-          GOOS=linux   go build -o ./builds/tinyfeed_linux_amd64
-          GOOS=freebsd go build -o ./builds/tinyfeed_freebsd_amd64
-          GOOS=darwin  go build -o ./builds/tinyfeed_darwin_amd64
-          GOOS=windows go build -o ./builds/tinyfeed_windows_amd64
-
-          sudo apt install upx
-          upx ./builds/tinyfeed_linux*
-          upx ./builds/tinyfeed_windows*
+          mkdir dist
+          for target in \
+            linux/amd64 linux/arm64 \
+            darwin/amd64 darwin/arm64 \
+            freebsd/amd64 freebsd/arm64 \
+            windows/amd64 windows/arm64
+          do
+            os="${target%/*}"
+            arch="${target#*/}"
+            extension=""
+            if [ "$os" = "windows" ]; then
+              extension=".exe"
+            fi
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags="-s -w" \
+              -o "dist/tinyfeed_${os}_${arch}${extension}" .
+          done
+          cd dist
+          sha256sum tinyfeed_* > checksums.txt
 
       - name: release
-        uses: ncipollo/release-action@440c8c1cb0ed28b9f43e4d1d670870f059653174
-        with:
-          artifacts: "./builds/*"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
